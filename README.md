@@ -7,6 +7,7 @@ to do:
 
 dependencies:
     - numpy
+    - numba
     - pyfftw
     - tqdm
     - matplotlib (for the example notebook)
