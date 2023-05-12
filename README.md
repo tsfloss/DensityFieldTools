@@ -6,9 +6,9 @@ to do:
             (a simple numba implementation suffers from poor floating point performance when used on float32 grids, leading to inaccurate measurements)
 
 dependencies:
-    - numpy
-    - numba
-    - pyfftw
-    - tqdm
-    - matplotlib (for the example notebook)
+- numpy
+- numba
+- pyfftw
+- tqdm
+- matplotlib (for the example notebook)
     
