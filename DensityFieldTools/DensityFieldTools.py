@@ -247,11 +247,11 @@ class DensityField3D():
             r_ones_shells[i] = self.mask_c2r(c_ones,k_low,k_high)
             
         if verbose: print("Computing Powerspectrum Counts...",end=' ')
-        counts['counts_P'] = _Pk_shells(r_ones_shells) * self.grid**3
+        counts['counts_P'] = _Pk_shells(r_ones_shells,verbose) * self.grid**3
 
         if verbose: print("Computing Triangle Counts...",end=' ')
         bin_indices = ((counts['bin_centers'] - fc) // dk).astype(np.int64)
-        counts['counts_B'] = _Bk_shells(r_ones_shells, bin_indices) * self.grid**6
+        counts['counts_B'] = _Bk_shells(r_ones_shells, bin_indices,verbose) * self.grid**6
 
         np.save(file_name,counts)
         if verbose: print(f"Saved Triangle Counts to {file_name}")
@@ -301,11 +301,11 @@ class DensityField3D():
             r_delta_shells[i] = self.mask_c2r(self.c_delta,k_low,k_high)
 
         if verbose: print(f"Computing Powerspectrum...",end=' ') 
-        P = _Pk_shells(r_delta_shells) * self.BoxSize**3 / counts['counts_P'] / self.grid**3
+        P = _Pk_shells(r_delta_shells,verbose) * self.BoxSize**3 / counts['counts_P'] / self.grid**3
 
         if verbose: print(f"Computing Bispectrum...",end=' ')    
         bin_indices = ((counts['bin_centers'] - fc) // dk).astype(np.int64)
-        B = _Bk_shells(r_delta_shells,bin_indices) * self.BoxSize**6 / self.grid**3
+        B = _Bk_shells(r_delta_shells,bin_indices,verbose) * self.BoxSize**6 / self.grid**3
 
         result = np.ones((len(counts['bin_centers']),8))
         result[:,:3] = counts['bin_centers']
@@ -315,26 +315,39 @@ class DensityField3D():
 
         return result
 
-def _Pk_shells(r_delta_shells):
+def _Pk_shells(r_delta_shells,verbose):
     """
     Helperfunction to compute powerspectrum of binned real density fields
     """
     P_measured = np.zeros(len(r_delta_shells))
-    for i in tqdm(range(len(r_delta_shells))):
+    for i in tqdm(range(len(r_delta_shells)),disable= not verbose):
         P_measured[i] = np.sum((r_delta_shells[i]**2))
     return P_measured
     
-def _Bk_shells(r_delta_shells, bin_indices):
+def _Bk_shells(r_delta_shells, bin_indices,verbose):
     """
     Helperfunction to compute bispectrum of binned real density fields
     """
     B_measured = np.zeros(len(bin_indices))
-    for bin_i in tqdm(range(len(bin_indices))):
+    for bin_i in tqdm(range(len(bin_indices)),disable= not verbose):
         bin_index = bin_indices[bin_i]
         B_measured[bin_i] = np.sum(r_delta_shells[bin_index[0]]\
                                     *r_delta_shells[bin_index[1]]\
                                     *r_delta_shells[bin_index[2]])
     return B_measured
+
+# @njit(parallel=True)
+# def _Bk_shells(r_delta_shells, bin_indices,verbose):
+#     """
+#     Helperfunction to compute bispectrum of binned real density fields
+#     """
+#     B_measured = np.zeros(len(bin_indices))
+#     for bin_i in prange(len(bin_indices)):
+#         bin_index = bin_indices[bin_i]
+#         B_measured[bin_i] = np.sum(r_delta_shells[bin_index[0]]\
+#                                     *r_delta_shells[bin_index[1]]\
+#                                     *r_delta_shells[bin_index[2]])
+#     return B_measured
 
 
 def _make_FFTW_wisdom_3D(grid,r_dtype,c_dtype,nthreads):
