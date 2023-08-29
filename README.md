@@ -1,10 +1,11 @@
 # DensityFieldTools
-Tools for manipulating density fields and measuring power spectra and bispectra
+DensityFieldTools is a set of tools for manipulating density fields and in particular for measuring power spectra and bispectra using a very simple interface.
+See the provided example notebook!
 
-dependencies:
-    - numpy
-    - numba
-    - pyfftw
-    - tqdm (for progress and parallelization)
-    - matplotlib (for the example notebook)
+Dependencies:
+- numpy
+- numba
+- pyfftw
+- tqdm (for progressbar and parallelization)
+- matplotlib (for the example notebook)
     
