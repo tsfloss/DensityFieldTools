@@ -3,6 +3,7 @@ import numpy as np
 import pyfftw
 from tqdm import tqdm
 from numba import njit, prange, set_num_threads
+from tqdm.contrib.concurrent import thread_map
 
 class DensityField3D():
     """
@@ -123,11 +124,11 @@ class DensityField3D():
         self.fft_c2r = pyfftw.FFTW(self.c_fftgrid, self.r_fftgrid, axes=tuple(range(3)),\
                                 direction="FFTW_BACKWARD",threads=self.n_threads,flags=[self.FFTW_FLAG])
         
-        #Allocate array for real and complex grids to be saved and in case given load density and FFT
-        self.r_delta = np.zeros_like(self.r_fftgrid)
-        self.c_delta = np.zeros_like(self.c_fftgrid)
+        # #Allocate array for real and complex grids to be saved and in case given load density and FFT
+        self.r_delta = np.zeros(self.rshape,dtype=self.r_dtype)
+        self.c_delta = np.zeros(self.cshape,dtype=self.c_dtype)
         
-        #Setup mesh and k-space grid
+        # # Setup mesh and k-space grid
         self.kx = 2 * np.pi * np.fft.fftfreq(self.grid, self.cell_size)
         self.ky = 2 * np.pi * np.fft.fftfreq(self.grid, self.cell_size)
         self.kz = 2 * np.pi * np.fft.rfftfreq(self.grid, self.cell_size) # Note rfft.
@@ -243,15 +244,17 @@ class DensityField3D():
         for i in tqdm(range(NBmax),disable= not verbose):
             k_low = self.kF * (fc + dk * i - dk/2)
             k_high= self.kF * (fc + dk * i + dk/2)
-            # print(k_low,k_high)
             r_ones_shells[i] = self.mask_c2r(c_ones,k_low,k_high)
             
         if verbose: print("Computing Powerspectrum Counts...",end=' ')
-        counts['counts_P'] = _Pk_shells(r_ones_shells,verbose) * self.grid**3
+        counts['counts_P'] = np.array(thread_map(lambda bin_i: np.sum(r_ones_shells[bin_i]**2)\
+                                ,np.arange(len(r_ones_shells)),max_workers=self.n_threads,tqdm_class=tqdm,disable= not verbose)) * self.grid**3
 
         if verbose: print("Computing Triangle Counts...",end=' ')
         bin_indices = ((counts['bin_centers'] - fc) // dk).astype(np.int64)
-        counts['counts_B'] = _Bk_shells(r_ones_shells, bin_indices,verbose) * self.grid**6
+
+        counts['counts_B'] = B = np.array(thread_map(lambda bin_i: np.sum(r_ones_shells[bin_indices[bin_i][0]]*r_ones_shells[bin_indices[bin_i][1]]*r_ones_shells[bin_indices[bin_i][2]])\
+                                ,np.arange(len(bin_indices)),max_workers=self.n_threads,tqdm_class=tqdm,disable= not verbose)) * self.grid**6
 
         np.save(file_name,counts)
         if verbose: print(f"Saved Triangle Counts to {file_name}")
@@ -300,12 +303,14 @@ class DensityField3D():
             k_high= self.kF * (fc + dk * i + dk/2)
             r_delta_shells[i] = self.mask_c2r(self.c_delta,k_low,k_high)
 
-        if verbose: print(f"Computing Powerspectrum...",end=' ') 
-        P = _Pk_shells(r_delta_shells,verbose) * self.BoxSize**3 / counts['counts_P'] / self.grid**3
+        if verbose: print(f"Computing Powerspectrum...",end=' ')
+        P = np.array(thread_map(lambda bin_i: np.sum(r_delta_shells[bin_i]**2)\
+                                ,np.arange(len(r_delta_shells)),max_workers=self.n_threads,tqdm_class=tqdm,disable= not verbose)) * self.BoxSize**3 / counts['counts_P'] / self.grid**3
 
         if verbose: print(f"Computing Bispectrum...",end=' ')    
         bin_indices = ((counts['bin_centers'] - fc) // dk).astype(np.int64)
-        B = _Bk_shells(r_delta_shells,bin_indices,verbose) * self.BoxSize**6 / self.grid**3
+        B = np.array(thread_map(lambda bin_i: np.sum(r_delta_shells[bin_indices[bin_i][0]]*r_delta_shells[bin_indices[bin_i][1]]*r_delta_shells[bin_indices[bin_i][2]])\
+                                ,np.arange(len(bin_indices)),max_workers=self.n_threads,tqdm_class=tqdm,disable= not verbose)) * self.BoxSize**6 / self.grid**3
 
         result = np.ones((len(counts['bin_centers']),8))
         result[:,:3] = counts['bin_centers']
@@ -314,41 +319,6 @@ class DensityField3D():
         result[:,7] = counts['counts_B']
 
         return result
-
-def _Pk_shells(r_delta_shells,verbose):
-    """
-    Helperfunction to compute powerspectrum of binned real density fields
-    """
-    P_measured = np.zeros(len(r_delta_shells))
-    for i in tqdm(range(len(r_delta_shells)),disable= not verbose):
-        P_measured[i] = np.sum((r_delta_shells[i]**2))
-    return P_measured
-    
-def _Bk_shells(r_delta_shells, bin_indices,verbose):
-    """
-    Helperfunction to compute bispectrum of binned real density fields
-    """
-    B_measured = np.zeros(len(bin_indices))
-    for bin_i in tqdm(range(len(bin_indices)),disable= not verbose):
-        bin_index = bin_indices[bin_i]
-        B_measured[bin_i] = np.sum(r_delta_shells[bin_index[0]]\
-                                    *r_delta_shells[bin_index[1]]\
-                                    *r_delta_shells[bin_index[2]])
-    return B_measured
-
-# @njit(parallel=True)
-# def _Bk_shells(r_delta_shells, bin_indices,verbose):
-#     """
-#     Helperfunction to compute bispectrum of binned real density fields
-#     """
-#     B_measured = np.zeros(len(bin_indices))
-#     for bin_i in prange(len(bin_indices)):
-#         bin_index = bin_indices[bin_i]
-#         B_measured[bin_i] = np.sum(r_delta_shells[bin_index[0]]\
-#                                     *r_delta_shells[bin_index[1]]\
-#                                     *r_delta_shells[bin_index[2]])
-#     return B_measured
-
 
 def _make_FFTW_wisdom_3D(grid,r_dtype,c_dtype,nthreads):
     """
@@ -460,7 +430,6 @@ def _PkX_numba(c_delta_1,c_delta_2,kgrid,BoxSize):
 
     kmax_n = np.int64((np.ceil(kmax/kF)))
     
-    assert c_delta_1.shape[0] == c_delta_2.shape[1], "Only equal dimensions are supported"
     Pks = np.zeros((kmax_n-1,5),dtype=np.float64)
 
     for kxi in range(c_delta_1.shape[0]):
