@@ -140,20 +140,20 @@ class DensityField3D():
         
     def compensate_MAS(self,MAS):
         """
-        Apply the compensation for the chosen mode assignment scheme to the density field.
+        Apply the compensation for the chosen mass assignment scheme to the density field.
 
         Parameters
         ----------
         self : object
             Object that holds the required input parameters and intermediate results.
         MAS : str
-            Mode assignment scheme to be used. Currently supported values are 'NGP' (nearest grid point),
+            Mass assignment scheme to be used. Currently supported values are 'NGP' (nearest grid point),
             'CIC' (cloud-in-cell), 'TSC' (triangular-shaped cloud), and 'PCS' (piecewise cubic spline).
 
         Raises
         ------
         Exception
-            If the specified mode assignment scheme is not one of the supported values.
+            If the specified mass assignment scheme is not one of the supported values.
 
         Returns
         -------
@@ -161,7 +161,7 @@ class DensityField3D():
 
         Notes
         -----
-        This function applies the mode assignment compensation factor to the density field, according to the
+        This function applies the mass assignment compensation factor to the density field, according to the
         chosen scheme. The compensation factor corrects for the effect of the finite grid resolution on the
         measured power spectrum.
 
@@ -194,7 +194,7 @@ class DensityField3D():
         self.r_delta = self.r_fftgrid.copy()
         
     def Pk(self):
-        return _Pk_numba(self.c_delta,self.kgrid,self.BoxSize)
+        return _Pk_numba(self.c_delta,self.BoxSize)
 
 
     def mask_c2r(self,delta_c,k_low,k_high):
@@ -342,7 +342,7 @@ def _make_FFTW_wisdom_3D(grid,r_dtype,c_dtype,nthreads):
         print("done!")
 
 @njit
-def _Pk_numba(c_delta_1,kgrid,BoxSize):
+def _Pk_numba(c_delta_1,BoxSize):
     """
     Computes the self-power spectrum of a complex fields c_delta_1
     in bins of width 1*kF up to kmax or Nyquist frequency.
@@ -368,36 +368,46 @@ def _Pk_numba(c_delta_1,kgrid,BoxSize):
     grid = c_delta_1.shape[0]
     cell_size = BoxSize/grid
     kF = 2*np.pi / BoxSize
-    kNyq = kF * grid / 2
+    kNyq = grid // 2
     kmax = kNyq
 
-    kmax_n = np.int64((np.ceil(kmax/kF)))
-
-    Pks = np.zeros((kmax_n-1,3),dtype=np.float64)
+    Pks = np.zeros((kmax,3),dtype=np.float64)
 
     for kxi in range(c_delta_1.shape[0]):
+        kx = (kxi-grid if (kxi>grid//2) else kxi)
         for kyi in range(c_delta_1.shape[1]):
+            ky = (kyi-grid if (kyi>grid//2) else kyi)
             for kzi in range(c_delta_1.shape[2]):
-                if kxi==0 and kyi==0 and kzi==0: continue
+                kz = kzi
 
-                k = kgrid[kxi,kyi,kzi]
+                # kz=0 and kz=middle planes are special
+                if kz==0 or (kz==grid//2 and grid%2==0):
+                    if kx<0: continue
+                    elif kx==0 or (kx==grid//2 and grid%2==0):
+                        if ky<0.0: continue
+
+                k = np.sqrt(kx**2. + ky**2. + kzi**2.)
                 if k >= kmax: continue
-                k_index = np.int64((np.floor(k/kF)))
+                k_index = np.int64(k)
+                # print(k,k_index)
                 
                 delta_1 = c_delta_1[kxi,kyi,kzi]
                 delta_1_norm2 = delta_1.real**2 + delta_1.imag**2
 
-                Pks[k_index-1,0] += k
-                Pks[k_index-1,1] += delta_1_norm2
-                Pks[k_index-1,-1] += 1.
+                Pks[k_index,0] += k
+                Pks[k_index,1] += delta_1_norm2
+                Pks[k_index,-1] += 1.
 
-    Pks[:,0] /= Pks[:,-1]
+    Pks[:,0] *= kF / Pks[:,-1]
     Pks[:,1] *= 1/Pks[:,-1] * BoxSize**3 / grid**6
 
-    return Pks        
+    Pks = Pks[1:]
+
+    return Pks
+      
 
 @njit
-def _PkX_numba(c_delta_1,c_delta_2,kgrid,BoxSize):
+def _PkX_numba(c_delta_1,c_delta_2,BoxSize):
     """
     Computes the self- and cross-power spectra of two complex fields c_delta_1 and c_delta_2
     in bins of width 1*kF up to kmax or Nyquist frequency.
@@ -425,21 +435,27 @@ def _PkX_numba(c_delta_1,c_delta_2,kgrid,BoxSize):
     grid = c_delta_1.shape[0]
     cell_size = BoxSize/grid
     kF = 2*np.pi / BoxSize
-    kNyq = kF * grid / 2
+    kNyq = grid // 2
     kmax = kNyq
 
-    kmax_n = np.int64((np.ceil(kmax/kF)))
-    
-    Pks = np.zeros((kmax_n-1,5),dtype=np.float64)
+    Pks = np.zeros((kmax,5),dtype=np.float64)
 
     for kxi in range(c_delta_1.shape[0]):
+        kx = (kxi-grid if (kxi>grid//2) else kxi)
         for kyi in range(c_delta_1.shape[1]):
+            ky = (kyi-grid if (kyi>grid//2) else kyi)
             for kzi in range(c_delta_1.shape[2]):
-                if kxi==0 and kyi==0 and kzi==0: continue
+                kz = kzi
 
-                k = kgrid[kxi,kyi,kzi]
+                # kz=0 and kz=middle planes are special
+                if kz==0 or (kz==grid//2 and grid%2==0):
+                    if kx<0: continue
+                    elif kx==0 or (kx==grid//2 and grid%2==0):
+                        if ky<0.0: continue
+
+                k = np.sqrt(kx**2. + ky**2. + kzi**2.)
                 if k >= kmax: continue
-                k_index = np.int64((np.floor(k/kF)))
+                k_index = np.int64(k)
                 
                 delta_1 = c_delta_1[kxi,kyi,kzi]
                 delta_1_norm2 = delta_1.real**2 + delta_1.imag**2
@@ -449,16 +465,17 @@ def _PkX_numba(c_delta_1,c_delta_2,kgrid,BoxSize):
                     
                 delta_X_norm2 = (delta_1 * np.conj(delta_2)).real
 
-                Pks[k_index-1,0] += k
-                Pks[k_index-1,1] += delta_1_norm2
-                Pks[k_index-1,2] += delta_2_norm2
-                Pks[k_index-1,3] += delta_X_norm2
-                Pks[k_index-1,-1] += 1.
+                Pks[k_index,0] += k
+                Pks[k_index,1] += delta_1_norm2
+                Pks[k_index,2] += delta_2_norm2
+                Pks[k_index,3] += delta_X_norm2
+                Pks[k_index,-1] += 1.
 
-    Pks[:,0] /= Pks[:,-1]
+    Pks[:,0] *= kF / Pks[:,-1]
     Pks[:,1] *= 1/Pks[:,-1] * BoxSize**3 / grid**6
     Pks[:,2] *= 1/Pks[:,-1] * BoxSize**3 / grid**6
     Pks[:,3] *= 1/Pks[:,-1] * BoxSize**3 / grid**6
+    Pks = Pks[1:]
     return Pks
 
 def PkX(r_delta_1,BoxSize,r_delta_2=None,MAS=[None,None],n_threads=1):
@@ -537,6 +554,6 @@ def PkX(r_delta_1,BoxSize,r_delta_2=None,MAS=[None,None],n_threads=1):
         c_delta_2 = c_fftgrid.copy()
         if MAS[1]!=None: c_delta_2 = compensate_MAS(c_delta_2,MAS[1])
         
-        return _PkX_numba(c_delta_1,c_delta_2,kgrid,BoxSize)
+        return _PkX_numba(c_delta_1,c_delta_2,BoxSize)
     else:
-        return _Pk_numba(c_delta_1,kgrid,BoxSize)
+        return _Pk_numba(c_delta_1,BoxSize)
