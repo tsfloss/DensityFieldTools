@@ -1,8 +1,10 @@
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+
 import numpy as np
-import pyfftw
+import ducc0
 from tqdm import tqdm
-from numba import njit, prange, set_num_threads
+from numba import njit
 from tqdm.contrib.concurrent import thread_map
 
 class DensityField3D():
@@ -19,7 +21,7 @@ class DensityField3D():
         Real-space density field to load and FFT. Shape must match the grid.
     delta_c : ndarray, optional
         Complex Fourier-space density field to load and inverse FFT. Shape must match the grid.
-    n_threads : int, optional
+    nthreads : int, optional
         Number of threads to use for parallelization.
     FFTW_WISDOM : bool, optional
         Whether to use precomputed FFTW wisdom.
@@ -38,7 +40,7 @@ class DensityField3D():
         Fundamental mode of the box.
     kNyq : float
         Nyquist frequency of the grid.
-    n_threads : int
+    nthreads : int
         Number of threads used for parallelization.
     FFTW_WISDOM : bool
         Whether to use precomputed FFTW wisdom.
@@ -52,17 +54,9 @@ class DensityField3D():
         Shape of the real-space density grid.
     cshape : ndarray
         Shape of the Fourier-space density grid.
-    r_fftgrid : ndarray
-        Real-space density grid.
-    c_fftgrid : ndarray
-        Fourier-space density grid.
-    fft_r2c : pyfftw.FFTW
-        FFTW plan for real-to-complex Fourier transform.
-    fft_c2r : pyfftw.FFTW
-        FFTW plan for complex-to-real inverse Fourier transform.
-    r_delta : ndarray
+    delta_r : ndarray
         Real-space density field.
-    c_delta : ndarray
+    delta_c : ndarray
         Complex Fourier-space density field.
     kx : ndarray
         Array of x components of the wave vectors in Fourier space.
@@ -77,7 +71,7 @@ class DensityField3D():
 
     Methods
     -------
-    compensate_MAS(MAS)
+    _compensate_MAS(MAS)
         Compensate for the mass assignment scheme used.
     Load_r2c(delta_r, MAS=None)
         Load a real-space density field and transform it to Fourier space.
@@ -85,7 +79,7 @@ class DensityField3D():
         Load a complex Fourier-space density field and transform it to real space.
     """
     
-    def __init__(self, BoxSize, grid, delta_r=None, delta_c=None, n_threads=1, FFTW_WISDOM=False, r_dtype=np.float32):
+    def __init__(self, BoxSize, grid, nthreads=1):
         assert grid%2 == 0, "choose an even grid size"
         
         self.BoxSize = BoxSize 
@@ -94,77 +88,18 @@ class DensityField3D():
         self.kF = 2*np.pi / self.BoxSize
         self.kNyq = self.kF * self.grid / 2
         
-        self.n_threads = n_threads
-        self.FFTW_WISDOM = FFTW_WISDOM
-        
-        #Numerical precision either in np.floatXX or 'floatXX' format
-        self.r_dtype = r_dtype
-        if self.r_dtype == np.float32 or self.r_dtype == 'float32':
-            self.r_dtype = 'float32'
-            self.c_dtype = 'complex64'
-        elif self.r_dtype == np.float64 or self.r_dtype == 'float64':
-            self.r_dtype = 'float64'
-            self.c_dtype = 'complex128'
-        
-        if self.FFTW_WISDOM:
-            _make_FFTW_wisdom_3D(self.grid,self.r_dtype,self.c_dtype,self.n_threads)
-            self.FFTW_FLAG="FFTW_WISDOM_ONLY"
-        else:
-            self.FFTW_FLAG="FFTW_ESTIMATE"
-        
-        #Setup FFTW grids and transforms
-        self.rshape = np.array([self.grid,self.grid,self.grid])
-        self.cshape = np.array([self.grid,self.grid,self.grid//2 + 1])
-        self.r_fftgrid = pyfftw.empty_aligned(self.rshape, dtype=self.r_dtype)
-        self.c_fftgrid = pyfftw.empty_aligned(self.cshape, dtype=self.c_dtype)
-        
-        self.fft_r2c = pyfftw.FFTW(self.r_fftgrid, self.c_fftgrid, axes=tuple(range(3)),\
-                                direction="FFTW_FORWARD",threads=self.n_threads,flags=[self.FFTW_FLAG])
-        
-        self.fft_c2r = pyfftw.FFTW(self.c_fftgrid, self.r_fftgrid, axes=tuple(range(3)),\
-                                direction="FFTW_BACKWARD",threads=self.n_threads,flags=[self.FFTW_FLAG])
-        
-        # #Allocate array for real and complex grids to be saved and in case given load density and FFT
-        self.r_delta = np.zeros(self.rshape,dtype=self.r_dtype)
-        self.c_delta = np.zeros(self.cshape,dtype=self.c_dtype)
+        self.nthreads = nthreads
         
         # # Setup mesh and k-space grid
         self.kx = 2 * np.pi * np.fft.fftfreq(self.grid, self.cell_size)
         self.ky = 2 * np.pi * np.fft.fftfreq(self.grid, self.cell_size)
         self.kz = 2 * np.pi * np.fft.rfftfreq(self.grid, self.cell_size) # Note rfft.
-        self.kmesh = np.meshgrid(self.kx,self.ky,self.kz,indexing="ij")
+        self.kmesh = np.array(np.meshgrid(self.kx,self.ky,self.kz,indexing="ij"))
         self.kgrid = np.sqrt(self.kmesh[0]**2 + self.kmesh[1]**2 + self.kmesh[2]**2)
         
-        #Set numba threads for parallelization
-        set_num_threads(n_threads)
-        
-    def compensate_MAS(self,MAS):
+    def _compensate_MAS(self,MAS):
         """
         Apply the compensation for the chosen mass assignment scheme to the density field.
-
-        Parameters
-        ----------
-        self : object
-            Object that holds the required input parameters and intermediate results.
-        MAS : str
-            Mass assignment scheme to be used. Currently supported values are 'NGP' (nearest grid point),
-            'CIC' (cloud-in-cell), 'TSC' (triangular-shaped cloud), and 'PCS' (piecewise cubic spline).
-
-        Raises
-        ------
-        Exception
-            If the specified mass assignment scheme is not one of the supported values.
-
-        Returns
-        -------
-        None
-
-        Notes
-        -----
-        This function applies the mass assignment compensation factor to the density field, according to the
-        chosen scheme. The compensation factor corrects for the effect of the finite grid resolution on the
-        measured power spectrum.
-
         """
         p = {'NGP':1., "CIC":2., "TSC":3., "PCS":4.}[MAS]
         for i in range(3):
@@ -172,40 +107,32 @@ class DensityField3D():
             fac[fac==0.0]=1.
             mas_fac = (fac/np.sin(fac))**p
             mas_fac[fac==1.]=1.
-            self.c_delta *= mas_fac
-        return mas_fac
+            self.delta_c *= mas_fac
         
-    def Load_r2c(self,delta_r,MAS=None):
-        assert (delta_r.shape == self.r_delta.shape), "mismatching grid sizes"
-        self.r_delta = delta_r.copy()
-        np.copyto(self.r_fftgrid,self.r_delta)
-        self.fft_r2c()
-        self.c_delta = self.c_fftgrid.copy()
+    def read_real(self,delta_r,MAS=None):
+        assert (delta_r.shape == (self.grid,self.grid,self.grid)), "mismatching grid sizes"
+        self.delta_r = delta_r
+        self.delta_c = ducc0.fft.r2c(self.delta_r,nthreads=self.nthreads)
         if MAS!=None:
-            self.compensate_MAS(MAS)
+            self._compensate_MAS(MAS)
         
-    def Load_c2r(self,delta_c,MAS=None):
-        assert (delta_c.shape == self.c_delta.shape), "mismatching grid sizes"
-        self.c_delta = delta_c.copy()
+    def read_complex(self,delta_c,MAS=None):
+        assert (delta_c.shape == self.delta_c.shape), "mismatching grid sizes"
+        self.delta_c = delta_c
         if MAS!=None:
-            self.compensate_MAS(MAS)
-        np.copyto(self.c_fftgrid,self.c_delta)
-        self.fft_c2r()
-        self.r_delta = self.r_fftgrid.copy()
+            self._compensate_MAS(MAS)
+        self.delta_r = ducc0.fft.c2r(self.delta_c,nthreads=self.nthreads,lastsize=self.grid,forward=False,inorm=2)
         
     def Pk(self):
-        return _Pk_numba(self.c_delta,self.BoxSize)
+        return _Pk_numba(self.delta_c,self.BoxSize)
 
-
-    def mask_c2r(self,delta_c,k_low,k_high):
+    def bin_c2r(self,delta_c,k_low,k_high):
         """
-        Cut off complex density field and return the real space density field
+        Bin complex density field and return the real space density field
         """
-        np.copyto(self.c_fftgrid,delta_c)
-        self.c_fftgrid[self.kgrid >= k_high] = 0.+0.j
-        self.c_fftgrid[self.kgrid < k_low] = 0.+0.j
-        self.fft_c2r()
-        return self.r_fftgrid
+        delta_c[self.kgrid >= k_high] = 0.+0.j
+        delta_c[self.kgrid < k_low] = 0.+0.j
+        return ducc0.fft.c2r(delta_c,nthreads=self.nthreads,lastsize=self.grid,forward=False,inorm=2)
     
     def _Bk_counts(self,fc,dk,NBmax,triangle_type,verbose):
         # Helperfunction that computes the triangle counts/volume to normalize binned bispectrum measurements
@@ -239,22 +166,22 @@ class DensityField3D():
         if verbose: print(f"Considering {len(counts['bin_centers'])} Triangle Configurations ({triangle_type})")
 
         if verbose: print(f"Creating Grids for Counts...")
-        c_ones = np.ones_like(self.c_fftgrid)
-        r_ones_shells = np.zeros((NBmax,self.rshape[0],self.rshape[1],self.rshape[2]),dtype=self.r_dtype)
+        c_ones = np.ones_like(self.delta_c)
+        r_ones_shells = np.zeros((NBmax,*self.delta_r.shape),dtype=self.delta_r.dtype)
         for i in tqdm(range(NBmax),disable= not verbose):
             k_low = self.kF * (fc + dk * i - dk/2)
             k_high= self.kF * (fc + dk * i + dk/2)
-            r_ones_shells[i] = self.mask_c2r(c_ones,k_low,k_high)
+            r_ones_shells[i] = self.bin_c2r(c_ones.copy(),k_low,k_high)
             
         if verbose: print("Computing Powerspectrum Counts...",end=' ')
         counts['counts_P'] = np.array(thread_map(lambda bin_i: np.sum(r_ones_shells[bin_i]**2)\
-                                ,np.arange(len(r_ones_shells)),max_workers=self.n_threads,tqdm_class=tqdm,disable= not verbose)) * self.grid**3
+                                ,np.arange(len(r_ones_shells)),max_workers=self.nthreads,tqdm_class=tqdm,disable= not verbose)) * self.grid**3
 
         if verbose: print("Computing Triangle Counts...",end=' ')
         bin_indices = ((counts['bin_centers'] - fc) // dk).astype(np.int64)
 
         counts['counts_B'] = B = np.array(thread_map(lambda bin_i: np.sum(r_ones_shells[bin_indices[bin_i][0]]*r_ones_shells[bin_indices[bin_i][1]]*r_ones_shells[bin_indices[bin_i][2]])\
-                                ,np.arange(len(bin_indices)),max_workers=self.n_threads,tqdm_class=tqdm,disable= not verbose)) * self.grid**6
+                                ,np.arange(len(bin_indices)),max_workers=self.nthreads,tqdm_class=tqdm,disable= not verbose)) * self.grid**6
 
         np.save(file_name,counts)
         if verbose: print(f"Saved Triangle Counts to {file_name}")
@@ -295,22 +222,22 @@ class DensityField3D():
         
         counts = self._Bk_counts(fc,dk,NBmax,triangle_type,verbose)
         # return 0
-        r_delta_shells = np.zeros((NBmax,self.rshape[0],self.rshape[1],self.rshape[2]),dtype=self.r_dtype)
+        delta_r_shells = np.zeros((NBmax,*self.delta_r.shape),dtype=self.delta_r.dtype)
 
         if verbose: print(f"Creating Grids for Measurements...")
         for i in tqdm(range(NBmax),disable= not verbose):
             k_low = self.kF * (fc + dk * i - dk/2)
             k_high= self.kF * (fc + dk * i + dk/2)
-            r_delta_shells[i] = self.mask_c2r(self.c_delta,k_low,k_high)
-
+            delta_r_shells[i] = self.bin_c2r(self.delta_c.copy(),k_low,k_high)
+            
         if verbose: print(f"Computing Powerspectrum...",end=' ')
-        P = np.array(thread_map(lambda bin_i: np.sum(r_delta_shells[bin_i]**2)\
-                                ,np.arange(len(r_delta_shells)),max_workers=self.n_threads,tqdm_class=tqdm,disable= not verbose)) * self.BoxSize**3 / counts['counts_P'] / self.grid**3
+        P = np.array(thread_map(lambda bin_i: np.sum(delta_r_shells[bin_i]**2)\
+                                ,np.arange(len(delta_r_shells)),max_workers=self.nthreads,tqdm_class=tqdm,disable= not verbose)) * self.BoxSize**3 / counts['counts_P'] / self.grid**3
 
         if verbose: print(f"Computing Bispectrum...",end=' ')    
         bin_indices = ((counts['bin_centers'] - fc) // dk).astype(np.int64)
-        B = np.array(thread_map(lambda bin_i: np.sum(r_delta_shells[bin_indices[bin_i][0]]*r_delta_shells[bin_indices[bin_i][1]]*r_delta_shells[bin_indices[bin_i][2]])\
-                                ,np.arange(len(bin_indices)),max_workers=self.n_threads,tqdm_class=tqdm,disable= not verbose)) * self.BoxSize**6 / self.grid**3
+        B = np.array(thread_map(lambda bin_i: np.sum(delta_r_shells[bin_indices[bin_i][0]]*delta_r_shells[bin_indices[bin_i][1]]*delta_r_shells[bin_indices[bin_i][2]])\
+                                ,np.arange(len(bin_indices)),max_workers=self.nthreads,tqdm_class=tqdm,disable= not verbose)) * self.BoxSize**6 / self.grid**3
 
         result = np.ones((len(counts['bin_centers']),8))
         result[:,:3] = counts['bin_centers']
@@ -320,36 +247,15 @@ class DensityField3D():
 
         return result
 
-def _make_FFTW_wisdom_3D(grid,r_dtype,c_dtype,nthreads):
-    """
-    Helperfunction to compute FFTW WISDOM
-    """
-    pyfftw.forget_wisdom()
-    file_name = f"pyFFTW_3D_grid{grid}_dtype{r_dtype}_threads{nthreads}.npy"
-    if os.path.exists(file_name):
-        # print(f"Loaded FFT Wisdom from {file_name}")
-        pyfftw.import_wisdom(np.load(file_name))
-    else:
-        print(f"Computing FFT Wisdom and Saving to {file_name}",end=' ')
-        rshape = np.array([grid,grid,grid])
-        cshape = rshape.copy()
-        cshape[-1] = (cshape[-1] // 2) + 1
-        r_fftgrid = pyfftw.empty_aligned(rshape, dtype=r_dtype)
-        c_fftgrid = pyfftw.empty_aligned(cshape, dtype=c_dtype)
-        fft = pyfftw.FFTW(r_fftgrid, c_fftgrid,axes=tuple(range(3)), direction="FFTW_FORWARD",threads=nthreads,flags=['FFTW_MEASURE'])
-        inv_fft = pyfftw.FFTW(c_fftgrid, r_fftgrid,axes=tuple(range(3)), direction="FFTW_BACKWARD",threads=nthreads,flags=['FFTW_MEASURE'])
-        np.save(file_name,pyfftw.export_wisdom())
-        print("done!")
-
 @njit
-def _Pk_numba(c_delta_1,BoxSize):
+def _Pk_numba(delta_c_1,BoxSize):
     """
-    Computes the self-power spectrum of a complex fields c_delta_1
+    Computes the self-power spectrum of a complex fields delta_c_1
     in bins of width 1*kF up to kmax or Nyquist frequency.
 
     Parameters:
     -----------
-    c_delta_1: ndarray of complex numbers with shape (N, N, N)
+    delta_c_1: ndarray of complex numbers with shape (N, N, N)
         The first complex field
     kgrid: ndarray of floats with shape (N, N, N)
         The grid of wavenumbers corresponding to the complex fields.
@@ -360,12 +266,12 @@ def _Pk_numba(c_delta_1,BoxSize):
     --------
     ndarray of floats with shape (kNyq/2-1, 3)
         The first column contains the k values.
-        The second and third columns contain the power spectrum of c_delta_1 and c_delta_2 respectively.
-        The fourth column contains the cross-power spectrum of c_delta_1 and c_delta_2.
+        The second and third columns contain the power spectrum of delta_c_1 and delta_c_2 respectively.
+        The fourth column contains the cross-power spectrum of delta_c_1 and delta_c_2.
         The last column contains the number of modes in each bin.
     """
     
-    grid = c_delta_1.shape[0]
+    grid = delta_c_1.shape[0]
     cell_size = BoxSize/grid
     kF = 2*np.pi / BoxSize
     kNyq = grid // 2
@@ -373,11 +279,11 @@ def _Pk_numba(c_delta_1,BoxSize):
 
     Pks = np.zeros((kmax,3),dtype=np.float64)
 
-    for kxi in range(c_delta_1.shape[0]):
+    for kxi in range(delta_c_1.shape[0]):
         kx = (kxi-grid if (kxi>grid//2) else kxi)
-        for kyi in range(c_delta_1.shape[1]):
+        for kyi in range(delta_c_1.shape[1]):
             ky = (kyi-grid if (kyi>grid//2) else kyi)
-            for kzi in range(c_delta_1.shape[2]):
+            for kzi in range(delta_c_1.shape[2]):
                 kz = kzi
 
                 # kz=0 and kz=middle planes are special
@@ -391,7 +297,7 @@ def _Pk_numba(c_delta_1,BoxSize):
                 k_index = np.int64(k)
                 # print(k,k_index)
                 
-                delta_1 = c_delta_1[kxi,kyi,kzi]
+                delta_1 = delta_c_1[kxi,kyi,kzi]
                 delta_1_norm2 = delta_1.real**2 + delta_1.imag**2
 
                 Pks[k_index,0] += k
@@ -407,17 +313,17 @@ def _Pk_numba(c_delta_1,BoxSize):
       
 
 @njit
-def _PkX_numba(c_delta_1,c_delta_2,BoxSize):
+def _PkX_numba(delta_c_1,delta_c_2,BoxSize):
     """
-    Computes the self- and cross-power spectra of two complex fields c_delta_1 and c_delta_2
+    Computes the self- and cross-power spectra of two complex fields delta_c_1 and delta_c_2
     in bins of width 1*kF up to kmax or Nyquist frequency.
 
     Parameters:
     -----------
-    c_delta_1: ndarray of complex numbers with shape (N, N, N)
+    delta_c_1: ndarray of complex numbers with shape (N, N, N)
         The first complex field
-    c_delta_2: ndarray of complex numbers with shape (N, N, N)
-        The second complex field. Must have equal dimensions with c_delta_1.
+    delta_c_2: ndarray of complex numbers with shape (N, N, N)
+        The second complex field. Must have equal dimensions with delta_c_1.
     kgrid: ndarray of floats with shape (N, N, N)
         The grid of wavenumbers corresponding to the complex fields.
     BoxSize: float
@@ -427,12 +333,12 @@ def _PkX_numba(c_delta_1,c_delta_2,BoxSize):
     --------
     ndarray of floats with shape (kNyq/2-1, 5)
         The first column contains the k values.
-        The second and third columns contain the power spectrum of c_delta_1 and c_delta_2 respectively.
-        The fourth column contains the cross-power spectrum of c_delta_1 and c_delta_2.
+        The second and third columns contain the power spectrum of delta_c_1 and delta_c_2 respectively.
+        The fourth column contains the cross-power spectrum of delta_c_1 and delta_c_2.
         The last column contains the number of modes in each bin.
     """
     
-    grid = c_delta_1.shape[0]
+    grid = delta_c_1.shape[0]
     cell_size = BoxSize/grid
     kF = 2*np.pi / BoxSize
     kNyq = grid // 2
@@ -440,11 +346,11 @@ def _PkX_numba(c_delta_1,c_delta_2,BoxSize):
 
     Pks = np.zeros((kmax,5),dtype=np.float64)
 
-    for kxi in range(c_delta_1.shape[0]):
+    for kxi in range(delta_c_1.shape[0]):
         kx = (kxi-grid if (kxi>grid//2) else kxi)
-        for kyi in range(c_delta_1.shape[1]):
+        for kyi in range(delta_c_1.shape[1]):
             ky = (kyi-grid if (kyi>grid//2) else kyi)
-            for kzi in range(c_delta_1.shape[2]):
+            for kzi in range(delta_c_1.shape[2]):
                 kz = kzi
 
                 # kz=0 and kz=middle planes are special
@@ -457,10 +363,10 @@ def _PkX_numba(c_delta_1,c_delta_2,BoxSize):
                 if k >= kmax: continue
                 k_index = np.int64(k)
                 
-                delta_1 = c_delta_1[kxi,kyi,kzi]
+                delta_1 = delta_c_1[kxi,kyi,kzi]
                 delta_1_norm2 = delta_1.real**2 + delta_1.imag**2
                 
-                delta_2 = c_delta_2[kxi,kyi,kzi]
+                delta_2 = delta_c_2[kxi,kyi,kzi]
                 delta_2_norm2 = delta_2.real**2 + delta_2.imag**2
                     
                 delta_X_norm2 = (delta_1 * np.conj(delta_2)).real
@@ -478,17 +384,17 @@ def _PkX_numba(c_delta_1,c_delta_2,BoxSize):
     Pks = Pks[1:]
     return Pks
 
-def PkX(r_delta_1,BoxSize,r_delta_2=None,MAS=[None,None],n_threads=1):
+def PkX(delta_r_1,BoxSize,delta_r_2=None,MAS=[None,None],nthreads=1):
     """
-    Computes the self- and cross-power spectra of two real fields r_delta_1 and r_delta_2
+    Computes the self- and cross-power spectra of two real fields delta_r_1 and delta_r_2
     in bins of width 1*kF up to kmax or Nyquist frequency.
 
     Parameters:
     -----------
-    r_delta_1: ndarray of real numbers with shape (N, N, N)
+    delta_r_1: ndarray of real numbers with shape (N, N, N)
         The first real field
-    r_delta_2: ndarray of real numbers with shape (N, N, N)
-        The second real field. Must have equal dimensions with r_delta_1.
+    delta_r_2: ndarray of real numbers with shape (N, N, N)
+        The second real field. Must have equal dimensions with delta_r_1.
     BoxSize: float
         The size of the box containing the real fields in units of Mpc/h.
 
@@ -496,17 +402,17 @@ def PkX(r_delta_1,BoxSize,r_delta_2=None,MAS=[None,None],n_threads=1):
     --------
     ndarray of floats with shape (kNyq/2-1, 3) if one real field is given
         The first column contains the k values.
-        The second column contains the power spectrum of r_delta_1.
+        The second column contains the power spectrum of delta_r_1.
         The last column contains the number of modes in each bin.
     
     ndarray of floats with shape (kNyq/2-1, 5) if two real fields are given
         The first column contains the k values.
-        The second and third columns contain the power spectrum of r_delta_1 and r_delta_2 respectively.
-        The fourth column contains the cross-power spectrum of r_delta_1 and r_delta_2.
+        The second and third columns contain the power spectrum of delta_r_1 and delta_r_2 respectively.
+        The fourth column contains the cross-power spectrum of delta_r_1 and delta_r_2.
         The last column contains the number of modes in each bin.
     """
         
-    grid = r_delta_1.shape[0]
+    grid = delta_r_1.shape[0]
     cell_size = BoxSize/grid
     kF = 2*np.pi/BoxSize
     
@@ -519,7 +425,7 @@ def PkX(r_delta_1,BoxSize,r_delta_2=None,MAS=[None,None],n_threads=1):
     rshape = np.array([grid,grid,grid])
     cshape = np.array([grid,grid,grid//2+1])
     
-    r_dtype = r_delta_1.dtype
+    r_dtype = delta_r_1.dtype
     if r_dtype == np.float32 or r_dtype == 'float32':
         r_dtype = 'float32'
         c_dtype = 'complex64'
@@ -529,31 +435,31 @@ def PkX(r_delta_1,BoxSize,r_delta_2=None,MAS=[None,None],n_threads=1):
 
     r_fftgrid = pyfftw.empty_aligned(rshape, dtype=r_dtype)
     c_fftgrid = pyfftw.empty_aligned(cshape, dtype=c_dtype)
-    fft = pyfftw.FFTW(r_fftgrid, c_fftgrid, axes=tuple(range(3)), direction="FFTW_FORWARD",threads=n_threads,flags=['FFTW_ESTIMATE'])
-    inv_fft = pyfftw.FFTW(c_fftgrid, r_fftgrid, axes=tuple(range(3)), direction="FFTW_BACKWARD",threads=n_threads,flags=['FFTW_ESTIMATE'])
+    fft = pyfftw.FFTW(r_fftgrid, c_fftgrid, axes=tuple(range(3)), direction="FFTW_FORWARD",threads=nthreads,flags=['FFTW_ESTIMATE'])
+    inv_fft = pyfftw.FFTW(c_fftgrid, r_fftgrid, axes=tuple(range(3)), direction="FFTW_BACKWARD",threads=nthreads,flags=['FFTW_ESTIMATE'])
     
-    def compensate_MAS(c_delta,MAS):
+    def _compensate_MAS(delta_c,MAS):
         p = {'NGP':1., "CIC":2., "TSC":3., "PCS":4.}[MAS]
         for i in range(3):
             fac = np.pi * k[i]/kF/grid
             fac[fac==0.0]=1.
             mas_fac = (fac/np.sin(fac))**p
             mas_fac[fac==1.]=1.
-            c_delta *= mas_fac
-        return c_delta
+            delta_c *= mas_fac
+        return delta_c
     
-    np.copyto(r_fftgrid,r_delta_1)
+    np.copyto(r_fftgrid,delta_r_1)
     fft()
-    c_delta_1 = c_fftgrid.copy()
-    if MAS[0]!=None: c_delta_1 = compensate_MAS(c_delta_1,MAS[0])
+    delta_c_1 = c_fftgrid.copy()
+    if MAS[0]!=None: delta_c_1 = _compensate_MAS(delta_c_1,MAS[0])
     
-    if type(r_delta_2)!= type(None):
-        assert r_delta_1.shape[0] == r_delta_2.shape[1], "Only equal dimensions are supported"
-        np.copyto(r_fftgrid,r_delta_2)
+    if type(delta_r_2)!= type(None):
+        assert delta_r_1.shape[0] == delta_r_2.shape[1], "Only equal dimensions are supported"
+        np.copyto(r_fftgrid,delta_r_2)
         fft()
-        c_delta_2 = c_fftgrid.copy()
-        if MAS[1]!=None: c_delta_2 = compensate_MAS(c_delta_2,MAS[1])
+        delta_c_2 = c_fftgrid.copy()
+        if MAS[1]!=None: delta_c_2 = _compensate_MAS(delta_c_2,MAS[1])
         
-        return _PkX_numba(c_delta_1,c_delta_2,BoxSize)
+        return _PkX_numba(delta_c_1,delta_c_2,BoxSize)
     else:
-        return _Pk_numba(c_delta_1,BoxSize)
+        return _Pk_numba(delta_c_1,BoxSize)
