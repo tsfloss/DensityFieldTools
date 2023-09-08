@@ -55,7 +55,7 @@ class DensityField3D():
         Compensate for the mass assignment scheme used.
     read_real(delta_r, MAS=None)
         Read in a real-space density field and transform it to Fourier space, optionally compensating for MAS.
-    Load_c2r(delta_c)
+    read_complex(delta_c,MAS=None)
         Read in a complex Fourier-space density field and transform it to real space, optionally compensating for MAS.
     """
     
