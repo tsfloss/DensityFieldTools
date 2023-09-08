@@ -51,17 +51,17 @@ class DensityField3D():
 
     Methods
     -------
-    _compensate_MAS(MAS)
-        Compensate for the mass assignment scheme used.
     read_real(delta_r, MAS=None)
         Read in a real-space density field and transform it to Fourier space, optionally compensating for MAS.
     read_complex(delta_c,MAS=None)
         Read in a complex Fourier-space density field and transform it to real space, optionally compensating for MAS.
+    Pk()
+        Compute the power spectrum of the density field using a loop over the complex Fourier-space field.
+    Bk(fc,dk,Nbins,triangle_type='All',verbose=False)
+        Compute the binned bispectrum of the density field for a given binning using Fast Fourier Transforms.
     """
     
     def __init__(self, BoxSize, grid, nthreads=1):
-        assert grid%2 == 0, "choose an even grid size"
-        
         self.BoxSize = BoxSize 
         self.grid = grid 
         self.cell_size = self.BoxSize/self.grid 
@@ -106,7 +106,7 @@ class DensityField3D():
     def Pk(self):
         return _Pk_numba(self.delta_c,self.BoxSize)
 
-    def bin_c2r(self,delta_c,k_low,k_high):
+    def _bin_c2r(self,delta_c,k_low,k_high):
         """
         Bin complex density field and return the real space density field
         """
@@ -114,11 +114,11 @@ class DensityField3D():
         delta_c[self.kgrid < k_low] = 0.+0.j
         return ducc0.fft.c2r(delta_c,nthreads=self.nthreads,lastsize=self.grid,forward=False,inorm=2)
     
-    def _Bk_counts(self,fc,dk,NBmax,triangle_type,verbose):
+    def _Bk_counts(self,fc,dk,Nbins,triangle_type,verbose):
         # Helperfunction that computes the triangle counts/volume to normalize binned bispectrum measurements
         # For a given binning this only has to be computed ones and can be saved to disk to save time
         
-        file_name = f"FFTest3D_BkCounts_LBox{self.BoxSize}_Grid{self.grid}_Binning{dk}kF_fc{fc}_NBins{NBmax}_TriangleType{triangle_type}.npy"
+        file_name = f"FFTest3D_BkCounts_LBox{self.BoxSize}_Grid{self.grid}_Binning{dk}kF_fc{fc}_NBins{Nbins}_TriangleType{triangle_type}.npy"
         
         if os.path.exists(file_name):
             if verbose: print(f"Loading Counts from {file_name}")
@@ -127,31 +127,31 @@ class DensityField3D():
             return counts
 
         counts = {}
-        counts['counts_P'] = np.zeros(NBmax)
+        counts['counts_P'] = np.zeros(Nbins)
 
         if triangle_type=='All':
             counts['bin_centers'] = np.array([(i,j,l)\
-                                              for i in fc+np.arange(0, (NBmax))*dk \
+                                              for i in fc+np.arange(0, (Nbins))*dk \
                                               for j in np.arange(fc, i+1, dk)\
                                               for l in np.arange(fc, j+1, dk) if i<=j+l+dk]) 
                                                 #the +dk allows for open bins (Biagetti '21)
 
         elif triangle_type=='Squeezed':
             counts['bin_centers'] = np.array([(i,i,j)\
-                                              for ji,j in enumerate(fc + np.arange(0,NBmax)*dk)\
-                                              for i in fc+np.arange(ji+1,NBmax)*dk])
+                                              for ji,j in enumerate(fc + np.arange(0,Nbins)*dk)\
+                                              for i in fc+np.arange(ji+1,Nbins)*dk])
         elif triangle_type=='Equilateral':
             counts['bin_centers'] = np.array([(i,i,i)\
-                                              for i in fc+np.arange(0,NBmax)*dk])
+                                              for i in fc+np.arange(0,Nbins)*dk])
         if verbose: print(f"Considering {len(counts['bin_centers'])} Triangle Configurations ({triangle_type})")
 
         if verbose: print(f"Creating Grids for Counts...")
         c_ones = np.ones_like(self.delta_c)
-        r_ones_shells = np.zeros((NBmax,*self.delta_r.shape),dtype=self.delta_r.dtype)
-        for i in tqdm(range(NBmax),disable= not verbose):
+        r_ones_shells = np.zeros((Nbins,*self.delta_r.shape),dtype=self.delta_r.dtype)
+        for i in tqdm(range(Nbins),disable= not verbose):
             k_low = self.kF * (fc + dk * i - dk/2)
             k_high= self.kF * (fc + dk * i + dk/2)
-            r_ones_shells[i] = self.bin_c2r(c_ones.copy(),k_low,k_high)
+            r_ones_shells[i] = self._bin_c2r(c_ones.copy(),k_low,k_high)
             
         if verbose: print("Computing Powerspectrum Counts...",end=' ')
         counts['counts_P'] = np.array(thread_map(lambda bin_i: np.sum(r_ones_shells[bin_i]**2)\
@@ -168,7 +168,7 @@ class DensityField3D():
                 
         return counts
         
-    def Bk(self,fc,dk,NBmax,triangle_type='All',verbose=False):
+    def Bk(self,fc,dk,Nbins,triangle_type='All',verbose=False):
         """
         Computes binned bispectrum of field for given binning and triangles
 
@@ -178,12 +178,13 @@ class DensityField3D():
             Center of first bin in units of the fundamental mode.
         dk: float
             Width of the bin in units of the fundamental mode.
-        NBmax: int
-            Total number of momentum bins such that bins are given by kf*[(fc + i)±dk/2 for i in range(NBmax)].
+        Nbins: int
+            Total number of momentum bins such that bins are given by kf*[(fc + i)±dk/2 for i in range(Nbins)].
         triangle_type: str, optional (default='All')
             Type of triangles to include in the bispectrum calculation. 
-            Options: 'All' (include all shapes of triangles), 'Squeezed' (only triangles k_1 > k_2 = k_3), 
-            'Equilateral' (include only triangles k_1 = k_2 = k_3).
+            Options: 'All' (include all shapes of triangles),
+                     'Squeezed' (only triangles k_1 > k_2 = k_3), 
+                     'Equilateral' (include only triangles k_1 = k_2 = k_3).
         verbose: bool, optional (default=False)
             If True, print progress statements.
 
@@ -199,16 +200,19 @@ class DensityField3D():
         this function will first compute the necessary mode counts for power spectrum and bispectrum normalization. 
         This is saved in a file in the local directory for later use, when measuring from other density fields but with the same binning.
         """
-        
-        counts = self._Bk_counts(fc,dk,NBmax,triangle_type,verbose)
+
+        kmax = fc + dk * (Nbins-1) + dk / 2
+        assert kmax <= self.grid/3, f"Attempting to compute bispectrum up to {kmax}*kF, whereas this FFT bispectrum estimator is limited to grid/3*kF={self.grid/3:.2f}*kF. Pick smaller Nbins or choose different binning."
+
+        counts = self._Bk_counts(fc,dk,Nbins,triangle_type,verbose)
         # return 0
-        delta_r_shells = np.zeros((NBmax,*self.delta_r.shape),dtype=self.delta_r.dtype)
+        delta_r_shells = np.zeros((Nbins,*self.delta_r.shape),dtype=self.delta_r.dtype)
 
         if verbose: print(f"Creating Grids for Measurements...")
-        for i in tqdm(range(NBmax),disable= not verbose):
+        for i in tqdm(range(Nbins),disable= not verbose):
             k_low = self.kF * (fc + dk * i - dk/2)
             k_high= self.kF * (fc + dk * i + dk/2)
-            delta_r_shells[i] = self.bin_c2r(self.delta_c.copy(),k_low,k_high)
+            delta_r_shells[i] = self._bin_c2r(self.delta_c.copy(),k_low,k_high)
             
         if verbose: print(f"Computing Powerspectrum...",end=' ')
         P = np.array(thread_map(lambda bin_i: np.sum(delta_r_shells[bin_i]**2)\
