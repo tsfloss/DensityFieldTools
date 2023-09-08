@@ -18,6 +18,6 @@ setup(
     url = "https://github.com/tsfloss/DensityFieldTools",
     packages=['DensityFieldTools'],
     install_requires=[
-          'numpy',"numba","tqdm","pyfftw",
+          'numpy',"numba","tqdm","ducc0",
       ],
 )

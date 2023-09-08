@@ -5,7 +5,6 @@ See the provided example notebook!
 Dependencies:
 - numpy
 - numba
-- pyfftw
-- tqdm (for progressbar and parallelization)
+- ducc0
+- tqdm
 - matplotlib (for the example notebook)
-    
