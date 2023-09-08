@@ -3,7 +3,7 @@ os.environ["OMP_NUM_THREADS"] = "1"
 
 import numpy as np
 import ducc0
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from numba import njit
 from tqdm.contrib.concurrent import thread_map
 
