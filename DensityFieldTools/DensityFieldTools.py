@@ -17,16 +17,8 @@ class DensityField3D():
         Size of the periodic box in Mpc/h units.
     grid : int
         Number of grid points per dimension.
-    delta_r : ndarray, optional
-        Real-space density field to load and FFT. Shape must match the grid.
-    delta_c : ndarray, optional
-        Complex Fourier-space density field to load and inverse FFT. Shape must match the grid.
     nthreads : int, optional
         Number of threads to use for parallelization.
-    FFTW_WISDOM : bool, optional
-        Whether to use precomputed FFTW wisdom.
-    r_dtype : str or np.dtype, optional
-        Data type for the density field in real space. Must be a valid numpy data type.
 
     Attributes
     ----------
@@ -42,18 +34,6 @@ class DensityField3D():
         Nyquist frequency of the grid.
     nthreads : int
         Number of threads used for parallelization.
-    FFTW_WISDOM : bool
-        Whether to use precomputed FFTW wisdom.
-    r_dtype : str
-        String representation of the data type for the density field in real space.
-    c_dtype : str
-        String representation of the data type for the density field in Fourier space.
-    FFTW_FLAG : str
-        String representation of the FFTW flag used.
-    rshape : ndarray
-        Shape of the real-space density grid.
-    cshape : ndarray
-        Shape of the Fourier-space density grid.
     delta_r : ndarray
         Real-space density field.
     delta_c : ndarray
@@ -73,10 +53,10 @@ class DensityField3D():
     -------
     _compensate_MAS(MAS)
         Compensate for the mass assignment scheme used.
-    Load_r2c(delta_r, MAS=None)
-        Load a real-space density field and transform it to Fourier space.
+    read_real(delta_r, MAS=None)
+        Read in a real-space density field and transform it to Fourier space, optionally compensating for MAS.
     Load_c2r(delta_c)
-        Load a complex Fourier-space density field and transform it to real space.
+        Read in a complex Fourier-space density field and transform it to real space, optionally compensating for MAS.
     """
     
     def __init__(self, BoxSize, grid, nthreads=1):
@@ -117,7 +97,7 @@ class DensityField3D():
             self._compensate_MAS(MAS)
         
     def read_complex(self,delta_c,MAS=None):
-        assert (delta_c.shape == self.delta_c.shape), "mismatching grid sizes"
+        assert (delta_c.shape == (self.grid,self.grid,self.grid//2+1)), "mismatching grid sizes"
         self.delta_c = delta_c
         if MAS!=None:
             self._compensate_MAS(MAS)
@@ -425,19 +405,6 @@ def PkX(delta_r_1,BoxSize,delta_r_2=None,MAS=[None,None],nthreads=1):
     rshape = np.array([grid,grid,grid])
     cshape = np.array([grid,grid,grid//2+1])
     
-    r_dtype = delta_r_1.dtype
-    if r_dtype == np.float32 or r_dtype == 'float32':
-        r_dtype = 'float32'
-        c_dtype = 'complex64'
-    elif r_dtype == np.float64 or r_dtype == 'float64':
-        r_dtype = 'float64'
-        c_dtype = 'complex128'
-
-    r_fftgrid = pyfftw.empty_aligned(rshape, dtype=r_dtype)
-    c_fftgrid = pyfftw.empty_aligned(cshape, dtype=c_dtype)
-    fft = pyfftw.FFTW(r_fftgrid, c_fftgrid, axes=tuple(range(3)), direction="FFTW_FORWARD",threads=nthreads,flags=['FFTW_ESTIMATE'])
-    inv_fft = pyfftw.FFTW(c_fftgrid, r_fftgrid, axes=tuple(range(3)), direction="FFTW_BACKWARD",threads=nthreads,flags=['FFTW_ESTIMATE'])
-    
     def _compensate_MAS(delta_c,MAS):
         p = {'NGP':1., "CIC":2., "TSC":3., "PCS":4.}[MAS]
         for i in range(3):
@@ -448,16 +415,12 @@ def PkX(delta_r_1,BoxSize,delta_r_2=None,MAS=[None,None],nthreads=1):
             delta_c *= mas_fac
         return delta_c
     
-    np.copyto(r_fftgrid,delta_r_1)
-    fft()
-    delta_c_1 = c_fftgrid.copy()
+    delta_c_1 = ducc0.fft.r2c(delta_r_1,nthreads=nthreads)
     if MAS[0]!=None: delta_c_1 = _compensate_MAS(delta_c_1,MAS[0])
     
     if type(delta_r_2)!= type(None):
         assert delta_r_1.shape[0] == delta_r_2.shape[1], "Only equal dimensions are supported"
-        np.copyto(r_fftgrid,delta_r_2)
-        fft()
-        delta_c_2 = c_fftgrid.copy()
+        delta_c_2 = ducc0.fft.r2c(delta_r_2,nthreads=nthreads)
         if MAS[1]!=None: delta_c_2 = _compensate_MAS(delta_c_2,MAS[1])
         
         return _PkX_numba(delta_c_1,delta_c_2,BoxSize)
